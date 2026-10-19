@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+모의고사 연습 메뉴바 앱 — 키보드 불빛 정답 버전
+- 내가 직접 만든 퀴즈(JSON) 문제를 메뉴바에서 연습 (5지선다 객관식)
+- Gemini API로 현재 문제를 풀어 정답을 알려줌:
+    · 실제 키보드 백라이트를 '정답 순번(A=1 ... E=5)'만큼 깜빡임 (맥북 백라이트는 1장짜리라 개별 키 점등 불가)
+    · 화면 하단 오버레이가 어떤 키가 정답인지 키캡 그림으로 표시
+- 주의: 이 앱은 화면을 읽지 않고, 내 JSON 퀴즈(자주 연습용 모의고사)만 다룹니다.
+        실제 시험 중 사용을 막는 구조이며, 학습용으로만 사용하세요.
+"""
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import rumps
+import kbflash
+import keylight
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+QUIZ_PATH = os.environ.get("QUIZ_FILE", os.path.join(BASE_DIR, "quiz.sample.json"))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+RESULTS_PATH = os.path.join(BASE_DIR, "results.json")
+AICACHE_PATH = os.path.join(BASE_DIR, "ai_cache.json")
+
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-5",
+    "openai": "gpt-4o-mini",
+    "google": "gemini-2.5-flash",
+}
+LETTERS = ["A", "B", "C", "D", "E"]
+
+DEFAULT_CONFIG = {
+    "provider": "google",
+    "model": "gemini-2.5-flash",
+    "auto_reveal": True,      # 문제를 열면 Gemini가 풀고 즉시 불빛으로 정답 알림
+    "show_overlay": True,     # 화면 하단 키캡 오버레이 표시
+    "keyflash": {
+        "level": 0.82,        # 점멸 밝기 0~1
+        "on_ms": 130,         # 켜짐 시간(ms)
+        "off_ms": 130,        # 꺼짐 시간(ms)
+        "repeats": 2,         # 점멸 패턴 반복 횟수 (2회 반복해 확실하게 셀 수 있게)
+        "on_answer": True,    # 내가 답을 고른 뒤 정답 키를 한 번 더 점멸
+    },
+}
+
+SYSTEM_PROMPT = (
+    "너는 모의고사 연습 문제 풀이 도우미다. 사용자가 준 5지선다 문제를 스스로 풀어 "
+    "정답을 구하고, 한국어로 풀이과정을 설명한다. "
+    "첫 줄은 반드시 '정답: X' 형식으로 시작한다. "
+    "이후 각 보기(A~E)별 근거와 출제 함정 포인트를 간결하게 설명한다."
+)
+
+GEMINI_ANSWER_PROMPT = (
+    "너는 국내 모의고사 채점 전문가다. 주어진 객관식 문제를 신중히 풀어 "
+    "정답 보기 문자 하나만 고른다. 함정 보기를 세심히 검토하고 정답률을 높여라. "
+    "explanation에는 2~3문장으로 핵심 근거를 쓴다."
+)
+
+
+# ---------- 데이터/설정 ----------
+
+def load_quiz(path=QUIZ_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    questions = []
+    for i, q in enumerate(data.get("questions", [])):
+        answer = str(q.get("answer", "")).strip().upper()[:1]
+        if answer not in LETTERS:
+            raise ValueError(f"문제 {i + 1}: answer 필드가 A~E 중 하나여야 합니다.")
+        questions.append(q)
+    if not questions:
+        raise ValueError("퀴즈 파일에 문제가 없습니다.")
+    return questions
+
+
+def present_letters(q):
+    return [l for l in LETTERS if (q.get("choices") or {}).get(l)]
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_results():
+    return load_json(RESULTS_PATH, {})
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    stored = load_json(CONFIG_PATH, {})
+    cfg.update({k: v for k, v in stored.items() if k != "keyflash"})
+    cfg["keyflash"] = {**DEFAULT_CONFIG["keyflash"], **(stored.get("keyflash") or {})}
+    return cfg
+
+
+def detect_provider(cfg):
+    p = (cfg.get("provider") or "auto").lower()
+    if p != "auto":
+        return p
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return "google"
+    return None
+
+
+def get_key(provider):
+    mapping = {
+        "anthropic": ["ANTHROPIC_API_KEY"],
+        "openai": ["OPENAI_API_KEY"],
+        "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    }
+    for name in mapping.get(provider, []):
+        v = os.environ.get(name)
+        if v:
+            return name, v
+    return None, None
+
+
+# ---------- Gemini: 구조화 정답 풀이 ----------
+
+def gemini_solve(question, cfg, key):
+    """{answer: 'B', explanation: '...'} 형태로 응답받는다. 실패 시 (None, 오류메시지)."""
+    model = cfg.get("model") or "gemini-2.5-flash"
+    letters = present_letters(question)
+    lines = ["다음 객관식 문제를 풀어줘.", "", question.get("text", "")]
+    for l in letters:
+        lines.append(f"{l}. {question['choices'][l]}")
+    payload = {
+        "system_instruction": {"parts": [{"text": GEMINI_ANSWER_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": "\n".join(lines)}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "answer": {"type": "STRING"},
+                    "explanation": {"type": "STRING"},
+                },
+                "required": ["answer"],
+            },
+        },
+    }
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
+    last_err = ""
+    for attempt in range(2):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                resp = json.loads(r.read().decode("utf-8"))
+            text = "".join(p.get("text", "") for p in resp["candidates"][0]["content"]["parts"])
+            data = json.loads(re.sub(r"^```json|```$", "", text.strip(), flags=re.M).strip() or "{}")
+            letter = str(data.get("answer", "")).strip().upper()[:1]
+            if letter in letters:
+                return {"answer": letter, "explanation": data.get("explanation", ""), "model": model}
+            last_err = f"AI가 유효하지 않은 보기({letter!r})를 골랐습니다."
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                body = ""
+            last_err = f"HTTP {e.code} {body}"
+            if e.code == 429:
+                time.sleep(2)
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)[:300]
+    return (None, last_err)
+
+
+# ---------- (기존) 범용 AI 해설 ----------
+
+def call_ai(provider, cfg, question, key):
+    model = cfg.get("model") or DEFAULT_MODELS[provider]
+    prompt = question_text_for_prompt(question)
+    timeout = 60
+    if provider == "anthropic":
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps({"model": model, "max_tokens": 1200, "system": SYSTEM_PROMPT,
+                             "messages": [{"role": "user", "content": prompt}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-api-key": key,
+                     "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        resp = json.loads(_read(req, timeout))
+        return "".join(b.get("text", "") for b in resp["content"])
+    if provider == "openai":
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps({"model": model, "temperature": 0,
+                             "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                                          {"role": "user", "content": prompt}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            method="POST",
+        )
+        resp = json.loads(_read(req, timeout))
+        return resp["choices"][0]["message"]["content"]
+    if provider == "google":
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model,
+            data=json.dumps({"system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                             "contents": [{"parts": [{"text": prompt}]}],
+                             "generationConfig": {"temperature": 0}}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+            method="POST",
+        )
+        resp = json.loads(_read(req, timeout))
+        return "".join(p.get("text", "") for p in resp["candidates"][0]["content"]["parts"])
+    raise RuntimeError(f"지원하지 않는 provider: {provider}")
+
+
+def _read(req, timeout):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"HTTP {e.code} {body}")
+
+
+def question_text_for_prompt(q):
+    lines = ["다음 5지선다 문제를 풀어줘:", "", q.get("text", "")]
+    for l in present_letters(q):
+        lines.append(f"{l}. {q['choices'][l]}")
+    return "\n".join(lines)
+
+
+def extract_ai_answer(text):
+    m = re.search(r"정\s*답\s*[:：]\s*\(?([A-Ea-e])\)?", text)
+    if not m:
+        m = re.search(r"\b([A-Ea-e])\b", text)
+    return m.group(1).upper() if m else None
+
+
+# ---------- 메뉴바 앱 ----------
+
+class QuizApp(rumps.App):
+    def __init__(self):
+        self.questions = load_quiz()
+        self.results = load_results()
+        self.config = load_config()
+        self.ai_cache = load_json(AICACHE_PATH, {})
+        self.idx = self._first_unanswered()
+        self._blink_token = 0      # 증가시키면 진행 중인 점멸 패턴이 중단됨
+        self._busy = False         # Gemini 정답 계산 중
+        self._result = None        # 스레드 → 메인 전달용
+        self._poll = None
+        self._auto_shown = None
+        self._last_chosen = None
+        self._ai_busy = False
+        self._ai_result = None
+        self._ai_timer = None
+        super().__init__("Quiz", icon=None, quit_button=None)
+        self.render()
+
+    # --- 상태 ---
+    def _first_unanswered(self):
+        for i, q in enumerate(self.questions):
+            if str(q.get("id", i)) not in self.results:
+                return i
+        return max(len(self.questions) - 1, 0)
+
+    def stats(self):
+        total = len(self.results)
+        ok = sum(1 for v in self.results.values() if v.get("ok"))
+        return ok, total
+
+    def qid(self, q):
+        return str(q.get("id", self.idx))
+
+    def _kf(self):
+        return self.config.get("keyflash") or {}
+
+    # --- 불빛 표시 ---
+    def reveal(self, letter, source, explanation="", use_overlay=None):
+        """정답 letter(A~E)을 불빛(점멸 횟수) + 오버레이로 알려준다. 메인 스레드에서 호출."""
+        q = self.questions[self.idx]
+        letters = present_letters(q)
+        if letter not in letters:
+            return
+        n = letters.index(letter) + 1
+        kf = self._kf()
+        self.title = f"💡 정답: {letter} ({n}회 점멸)"
+        show = self.config.get("show_overlay", True) if use_overlay is None else use_overlay
+        sub = f"{source} · 키보드 불빛 {n}회"
+        if explanation:
+            first = explanation.strip().splitlines()
+            if first:
+                sub += f" | {first[0][:64]}"
+        if show:
+            keylight.show_answer(
+                letters, letter, chosen=self._last_chosen,
+                headline=f"💡 정답: {letter}",
+                subtitle=sub,
+                seconds=4.2,
+            )
+        on_s = float(kf.get("on_ms", 130)) / 1000.0
+        off_s = float(kf.get("off_ms", 130)) / 1000.0
+        repeats = int(kf.get("repeats", 2))
+        level = float(kf.get("level", 0.82))
+        self._blink_token += 1
+        token = self._blink_token
+
+        def work():
+            if not kbflash.available():
+                return
+            for _ in range(max(repeats, 1)):
+                if token != self._blink_token:
+                    return
+                kbflash.flash_n(n, on_s, off_s, level)
+                time.sleep(0.8)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- Gemini 정답 자동 공개 ---
+    def _maybe_auto_reveal(self):
+        if not self.config.get("auto_reveal", True):
+            return
+        if not get_gemini_key():
+            return
+        q = self.questions[self.idx]
+        qid = self.qid(q)
+        if qid in self.results:
+            return
+        if self._auto_shown == qid:
+            return
+        self._auto_shown = qid
+        self.ai_reveal()
+
+    def ai_reveal(self, _=None):
+        """Gemini로 현재 문제를 풀어 정답 불빛으로 알려준다."""
+        if self._busy:
+            return
+        key = get_gemini_key()
+        if not key:
+            rumps.alert(
+                "GEMINI_API_KEY 없음",
+                "터미널에서 아래처럼 키를 넣고 앱을 다시 실행하세요.\n\n"
+                "cd quiz-practice\n"
+                "echo 'export GEMINI_API_KEY=AIza...' > .env\n"
+                "./run.sh",
+            )
+            return
+        self._busy = True
+        self._result = None
+        self.title = "⏳ AI 불빛 계산 중…"
+        threading.Thread(target=self._worker, args=(key,), daemon=True).start()
+        self._poll = rumps.Timer(self._poll_reveal, 0.4)
+        self._poll.start()
+
+    def _worker(self, key):
+        q = self.questions[self.idx]
+        qid = self.qid(q)
+        hit = self.ai_cache.get(qid)
+        if hit and hit.get("answer") in present_letters(q):
+            self._result = hit
+            return
+        res = gemini_solve(q, self.config, key)
+        if isinstance(res, dict):
+            self.ai_cache[qid] = res
+            save_json(AICACHE_PATH, self.ai_cache)
+            self._result = res
+        else:
+            self._result = ("err", res[1])
+
+    def _poll_reveal(self, timer):
+        res = self._result
+        if res is None:
+            return
+        timer.stop()
+        self._poll = None
+        self._busy = False
+        self._result = None
+        self.render()
+        if isinstance(res, tuple) and res[0] == "err":
+            rumps.alert("Gemini 정답 실패", str(res[1])[:1200])
+            return
+        letter = res.get("answer")
+        self.reveal(letter, "Gemini",
+                    res.get("explanation", "").replace("\n", " "))
+
+    # --- 렌더링 ---
+    def render(self):
+        q = self.questions[self.idx]
+        qkey = self.qid(q)
+        answered = self.results.get(qkey)
+        ok, total = self.stats()
+
+        progress = f"📖 Q{self.idx + 1}/{len(self.questions)} · 누적 {ok}/{total} 정답"
+        self.title = progress
+
+        items = [rumps.MenuItem(progress, callback=None), None]
+
+        qline = rumps.MenuItem("Q%d. %s" % (self.idx + 1, q.get("text", "")), callback=None)
+        qline.length = 90
+        items.append(qline)
+
+        for letter in LETTERS:
+            ch = q.get("choices", {}).get(letter)
+            if not ch:
+                continue
+            title = f"{letter}. {ch}"
+            if answered:
+                if letter.upper() == answered.get("chosen", ""):
+                    title += " ✔" if answered.get("ok") else " ✘"
+                if letter.upper() == q.get("answer", ""):
+                    title += " ← 정답"
+                it = rumps.MenuItem(title, callback=None)
+            else:
+                it = rumps.MenuItem(title, callback=self._make_answer(letter.upper()))
+            items.append(it)
+
+        items.append(None)
+        nav_prev = rumps.MenuItem("← 이전 문제", callback=self.prev if self.idx > 0 else None)
+        nav_next = rumps.MenuItem("다음 문제 →", callback=self.next if self.idx < len(self.questions) - 1 else None)
+        items += [nav_prev, nav_next, None]
+
+        items.append(rumps.MenuItem("💡 AI 정답 불빛 (Gemini)", callback=self.ai_reveal))
+        items.append(rumps.MenuItem("💡 저장된 정답 불빛 (API 없이)", callback=self.saved_reveal))
+        items.append(rumps.MenuItem(
+            "♾️ 자동 불빛: " + ("켬" if self.config.get("auto_reveal") else "끔"),
+            callback=self.toggle_auto))
+        items.append(rumps.MenuItem(
+            "✨ 불빛 오버레이: " + ("켬" if self.config.get("show_overlay") else "끔"),
+            callback=self.toggle_overlay))
+        items.append(None)
+        items.append(rumps.MenuItem("🤖 AI 해설 보기", callback=self.ai_explain))
+        items.append(None)
+        items.append(rumps.MenuItem("📝 퀴즈 파일 열기 (문제 추가/수정)", callback=self.open_quiz))
+        items.append(rumps.MenuItem("🔄 퀴즈 다시 불러오기", callback=self.reload_quiz))
+        items.append(rumps.MenuItem("🧹 풀이 기록 초기화", callback=self.reset_results))
+        items.append(rumps.MenuItem("❎ 앱 종료", callback=self.quit))
+        items.append(rumps.MenuItem("ℹ️ 학습 전용 — 화면을 읽지 않습니다", callback=None))
+
+        self.menu.clear()
+        self.menu = items
+
+        self._last_chosen = None
+        self._maybe_auto_reveal()
+
+    def _make_answer(self, letter):
+        def cb(_):
+            self.answer(letter)
+        return cb
+
+    # --- 동작 ---
+    def answer(self, letter):
+        q = self.questions[self.idx]
+        qkey = self.qid(q)
+        if qkey in self.results:
+            rumps.alert("이미 푼 문제", "이 문제는 이미 풀이 기록이 있습니다.\n풀이 기록 초기화 후 다시 풀어보세요.")
+            return
+        ok = letter.upper() == q.get("answer", "").upper()[:1]
+        self.results[qkey] = {"chosen": letter.upper(), "ok": ok}
+        save_json(RESULTS_PATH, self.results)
+        self._last_chosen = letter.upper()
+
+        if self._kf().get("on_answer", True):
+            self.reveal(q.get("answer", "").upper()[:1], "정답", use_overlay=False)
+
+        exp = q.get("explanation") or ""
+        verb = "정답! 🎉" if ok else "오답 🙂"
+        msg = f"고른 답: {letter} / 정답: {q.get('answer')}"
+        if exp:
+            msg += f"\n\n[해설]\n{exp}"
+        rumps.alert(verb, msg)
+
+        if self.idx == len(self.questions) - 1:
+            s_ok, s_total = self.stats()
+            pct = 100.0 * s_ok / s_total if s_total else 0
+            rumps.alert(
+                "모의고사 완료!",
+                f"총 {s_total}문제 중 {s_ok}개 정답 ({pct:.0f}%)\n\n틀린 문제는 '🤖 AI 해설 보기'로 개념을 다시 정리해 보세요.",
+            )
+        self.render()
+
+    def saved_reveal(self, _=None):
+        q = self.questions[self.idx]
+        ans = str(q.get("answer", "")).upper()[:1]
+        self._last_chosen = None
+        self.reveal(ans, "퀴즈 정답", use_overlay=True)
+
+    def next(self, _=None):
+        if self.idx < len(self.questions) - 1:
+            self.idx += 1
+            self.render()
+
+    def prev(self, _=None):
+        if self.idx > 0:
+            self.idx -= 1
+            self.render()
+
+    def toggle_auto(self, _=None):
+        self.config["auto_reveal"] = not self.config.get("auto_reveal", True)
+        save_json(CONFIG_PATH, self.config)
+        self.render()
+
+    def toggle_overlay(self, _=None):
+        self.config["show_overlay"] = not self.config.get("show_overlay", True)
+        save_json(CONFIG_PATH, self.config)
+        self.render()
+
+    def ai_explain(self, _=None):
+        if self._ai_busy:
+            return
+        provider = detect_provider(self.config)
+        if provider is None:
+            rumps.alert(
+                "API 키 없음",
+                "터미널에서 아래처럼 키를 넣고 앱을 다시 실행하세요.\n\n"
+                "cd quiz-practice\n"
+                "echo 'export GEMINI_API_KEY=AIza...' > .env\n"
+                "./run.sh\n\n"
+                "(Anthropic은 ANTHROPIC_API_KEY, OpenAI는 OPENAI_API_KEY)",
+            )
+            return
+        keyname, key = get_key(provider)
+        if not key:
+            rumps.alert("API 키 없음", f"{keyname} 환경변수를 설정한 뒤 다시 실행하세요.")
+            return
+
+        self._ai_busy = True
+        self._ai_result = None
+        self.title = "⏳ AI 풀이 받는 중…"
+        threading.Thread(target=self._ai_worker, args=(provider, key), daemon=True).start()
+        self._ai_timer = rumps.Timer(self._ai_poll, 0.4)
+        self._ai_timer.start()
+
+    def _ai_worker(self, provider, key):
+        q = self.questions[self.idx]
+        try:
+            self._ai_result = ("ok", call_ai(provider, self.config, q, key))
+        except Exception as e:  # noqa: BLE001
+            self._ai_result = ("err", str(e))
+
+    def _ai_poll(self, timer):
+        if self._ai_result is None:
+            return
+        timer.stop()
+        self._ai_busy = False
+        kind, text = self._ai_result
+        q = self.questions[self.idx]
+        self.render()
+        if kind == "err":
+            rumps.alert("AI 호출 실패", text[:1500])
+            return
+        stored = q.get("answer", "")
+        ai_ans = extract_ai_answer(text)
+        note = f"[퀴즈 데이터 정답: {stored}]\n"
+        if ai_ans and stored:
+            if ai_ans == stored.upper()[:1]:
+                note += "✅ AI가 데이터 정답과 같게 풀었습니다.\n"
+            else:
+                note += (
+                    f"⚠️ AI({ai_ans})와 데이터 정답({stored})이 다릅니다. "
+                    "내 문제의 정답 표기를 다시 확인해 보세요.\n"
+                )
+        rumps.Window(
+            note + "\n" + text.strip(),
+            title=f"AI 해설 — Q{self.idx + 1}",
+            ok="닫기",
+            dimensions=(520, 380),
+        ).run()
+
+    def open_quiz(self, _=None):
+        subprocess.run(["open", "-t", QUIZ_PATH])
+
+    def reload_quiz(self, _=None):
+        try:
+            self.questions = load_quiz()
+            self.results = load_results()
+            self.ai_cache = load_json(AICACHE_PATH, {})
+            self.idx = self._first_unanswered()
+            self.render()
+        except Exception as e:  # noqa: BLE001
+            rumps.alert("퀴즈 불러오기 실패", str(e)[:800])
+
+    def reset_results(self, _=None):
+        self.results = {}
+        try:
+            os.remove(RESULTS_PATH)
+        except FileNotFoundError:
+            pass
+        self.idx = 0
+        self.render()
+        rumps.alert("초기화됨", "풀이 기록을 모두 지웠습니다.")
+
+    def quit(self, _=None):
+        rumps.quit_application()
+
+
+def get_gemini_key():
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    return None
+
+
+if __name__ == "__main__":
+    QuizApp().run()
